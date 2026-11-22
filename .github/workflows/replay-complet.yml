@@ -1,0 +1,106 @@
+name: Recuperer le replay complet de 11 heures
+
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/replay-complet.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vicescope-replay-complet
+  cancel-in-progress: false
+
+jobs:
+  recuperer:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    env:
+      SOURCE_URL: https://www.youtube.com/watch?v=-6PVU387zOo
+      PYTHONUNBUFFERED: '1'
+    steps:
+      - name: Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: JavaScript pour YouTube
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Installer les outils officiels
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade 'yt-dlp[default]'
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+
+      - name: Recuperer et verifier la video entiere
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, shutil, subprocess, sys
+          url = os.environ["SOURCE_URL"]
+          out = pathlib.Path("replay")
+          out.mkdir(exist_ok=True)
+          base = [sys.executable, "-m", "yt_dlp", "--ignore-config",
+                  "--no-playlist", "--no-plugin-dirs", "--js-runtimes", "node",
+                  "--socket-timeout", "30", "--retries", "3", "--fragment-retries", "3",
+                  "--abort-on-unavailable-fragments", "--concurrent-fragments", "2"]
+          info = None
+          for height in (720, 480):
+              fmt = (f"bv[height<={height}][fps<=30][vcodec^=avc1]+ba[ext=m4a]/"
+                     f"b[height<={height}][ext=mp4]/bv[height<={height}]+ba/b[height<={height}]")
+              raw = subprocess.check_output(base + ["-f", fmt, "--skip-download",
+                                                    "--dump-single-json", "--", url], text=True)
+              info = json.loads(raw)
+              duration = float(info.get("duration") or 0)
+              if info.get("id") != "-6PVU387zOo" or abs(duration - 41930) > 10 or info.get("is_live"):
+                  raise RuntimeError("La source ne correspond pas au replay de 11 h 38 min 50 s.")
+              tracks = info.get("requested_formats") or [info]
+              estimated = sum(float(t.get("filesize") or t.get("filesize_approx") or 0) for t in tracks)
+              free = shutil.disk_usage(".").free
+              print(json.dumps({"title": info.get("title"), "channel": info.get("channel"),
+                                "duration_seconds": duration, "height_limit": height,
+                                "estimated_bytes": estimated, "free_bytes": free}, ensure_ascii=False), flush=True)
+              if estimated and estimated * 2.3 + 1024**3 < free:
+                  break
+              if height == 480:
+                  raise RuntimeError("Espace disque insuffisant ou taille impossible a estimer : arret avant telechargement.")
+          subprocess.run(base + ["-f", fmt, "--newline", "--progress-delta", "30",
+              "--merge-output-format", "mp4", "--remux-video", "mp4",
+              "-o", str(out / "VICEscope_replay_complet.%(ext)s"), "--", url], check=True)
+          video = out / "VICEscope_replay_complet.mp4"
+          probe = json.loads(subprocess.check_output(["ffprobe", "-v", "error", "-show_format",
+                                 "-show_streams", "-of", "json", str(video)], text=True))
+          actual = float(probe["format"]["duration"])
+          types = {s["codec_type"] for s in probe["streams"]}
+          if abs(actual - duration) > 10 or not {"audio", "video"} <= types:
+              raise RuntimeError("Verification en echec : duree incomplete ou piste audio/video absente.")
+          with video.open("rb") as handle:
+              digest = hashlib.file_digest(handle, "sha256").hexdigest()
+          manifest = {"source": url, "title": info.get("title"), "channel": info.get("channel"),
+                      "source_duration_seconds": duration, "file_duration_seconds": actual,
+                      "size_bytes": video.stat().st_size, "sha256": digest,
+                      "status": "complete_verified"}
+          (out / "verification.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+          print(json.dumps(manifest, ensure_ascii=False), flush=True)
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write("# Replay complet verifie\n\nVideo entiere : 11 h 38 min 50 s, avec image et son.\n\n")
+                  handle.write("Telecharger l'archive VICEscope-replay-complet dans Artifacts. Conservation : 1 jour.\n")
+
+      - name: Mettre la video complete a disposition
+        uses: actions/upload-artifact@v7
+        with:
+          name: VICEscope-replay-complet
+          path: |
+            replay/VICEscope_replay_complet.mp4
+            replay/verification.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
