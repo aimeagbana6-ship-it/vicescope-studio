@@ -100,7 +100,7 @@ def worker(job_id):
         if not source.is_file() and j['source_kind']=='youtube':
             update(job_id,'analyse',.03,'Import YouTube')
             url='https://www.youtube.com/watch?v='+j['source_label'].split()[-1]
-            subprocess.run([sys.executable,'-m','yt_dlp','--ignore-config','--no-playlist','--js-runtimes','node','--match-filter','!is_live & duration <= 10800','--max-filesize','500M','-f','b[ext=mp4]/b','-o',str(source),url],check=True,timeout=1800)
+            subprocess.run([sys.executable,'-m','yt_dlp','--ignore-config','--no-playlist','--js-runtimes','node','--match-filter','!is_live & duration <= 10800','--max-filesize','500M','-f','b[ext=mp4][height<=480]/b[height<=480]','-o',str(source),url],check=True,timeout=1800)
         if not source.is_file():raise RuntimeError('Import impossible ou source hors limites')
         total=duration(source)
         a=seconds(str(j['start']) if j['start'] is not None else '',0)
@@ -378,6 +378,23 @@ def preview_frame(job_id:str,request:Request):
 async def apply_layout(job_id:str,request:Request):
     check_request(request)
     obj=await request.json()
+    if obj.get('action')=='confirm_download':
+        with _mutex:
+            j=job(job_id)
+            if j['stage']=='downloaded':return {'ok':True}
+            if j['stage'] not in ('done','purging') or job_id in _pending:
+                raise HTTPException(409,'Le montage doit être terminé')
+            if sql("SELECT id FROM clips WHERE job_id=? AND state!='done'",(job_id,),True):
+                raise HTTPException(409,'Un rendu est encore en cours')
+            directory=BASE/job_id
+            if directory.parent!=BASE or directory.is_symlink() or len(job_id)!=24:
+                raise HTTPException(400,'Identifiant invalide')
+            # Reclaim disk before writing SQLite, which may be on a full volume.
+            if directory.is_dir():shutil.rmtree(directory)
+            with connect() as con:
+                con.execute('DELETE FROM clips WHERE job_id=?',(job_id,))
+                con.execute("UPDATE jobs SET stage='downloaded',message='Téléchargement confirmé, fichiers effacés' WHERE id=?",(job_id,))
+        return {'ok':True}
     try:
         opts=settings(obj['layout'],int(obj['share']),obj['style'],obj['position'],float(obj['y']),obj.get('camera'))
         if opts['layout']!='standard' and not opts['camera']:raise ValueError('Trace le cadre caméra sur la source')
