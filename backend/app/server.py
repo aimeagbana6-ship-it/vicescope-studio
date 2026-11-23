@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
@@ -158,6 +159,29 @@ def start_job(job_id):
 
 @app.on_event('startup')
 def resume_work():
+    # Imported sources are immutable. Keep each job path and share identical bytes.
+    groups={}
+    for rec in sql("SELECT source_path FROM jobs WHERE source_kind='youtube'",fetch=True):
+        source=Path(rec['source_path'])
+        if not source.is_file() or not source.resolve().is_relative_to(BASE): continue
+        groups.setdefault(source.stat().st_size,[]).append(source)
+    for paths in groups.values():
+        if len(paths)<2: continue
+        by_hash={}
+        for path in paths:
+            with path.open('rb') as stream:
+                digest=hashlib.file_digest(stream,'sha256').digest()
+            original=by_hash.setdefault(digest,path)
+            if original.samefile(path): continue
+            temp=path.with_name('source-'+secrets.token_hex(8)+'.link')
+            try:
+                os.link(original,temp)
+                os.replace(temp,path)
+            except OSError as exc:
+                print('Source deduplication skipped:',exc.errno,flush=True)
+            finally:
+                temp.unlink(missing_ok=True)
+    print('Studio storage available (MiB):',shutil.disk_usage(BASE).free//(1024**2),flush=True)
     for j in sql("SELECT id FROM jobs WHERE stage IN ('queued','analyse','montage','export')",fetch=True):
         start_job(j['id'])
 
@@ -236,6 +260,8 @@ async def create_job(request:Request,
     caption_style:str=Form('off'),caption_position:str=Form('lower'),caption_y:float|None=Form(None),
     preview:bool=Form(False)):
     check_request(request)
+    if shutil.disk_usage(BASE).free < 2*1024**2:
+        raise HTTPException(507,'Le stockage du serveur est plein. Libère de la place avant de lancer un montage.')
     if not authorized:raise HTTPException(400,'Confirmez que vous êtes autorisé à traiter cette vidéo')
     if not 1 <= max_clips <= 30:raise HTTPException(400,'Maximum non valide')
     if language not in ('fr','en','auto'):raise HTTPException(400,'Langue non valide')
