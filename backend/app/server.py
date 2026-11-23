@@ -26,7 +26,8 @@ BASE.mkdir(parents=True,exist_ok=True)
 DB=BASE/'vicescope.sqlite3'
 ROOT=Path(__file__).resolve().parent
 PASS=os.environ.get('STUDIO_PASSWORD','')
-if os.environ.get('STUDIO_ENV')=='production' and len(PASS)<20:
+KEY_HASH=os.environ.get('STUDIO_KEY_SHA256','')
+if os.environ.get('STUDIO_ENV')=='production' and len(PASS)<20 and len(KEY_HASH)!=64:
     raise RuntimeError('STUDIO_PASSWORD >= 20 caractères obligatoire en production')
 app=FastAPI(title='VICEscope Studio',docs_url=None,redoc_url=None,openapi_url=None)
 _mutex=threading.RLock()
@@ -66,6 +67,10 @@ def job(job_id):
 
 
 def check_request(req:Request):
+    if KEY_HASH:
+        candidate = hashlib.sha256(req.headers.get('x-studio-key','').encode()).hexdigest()
+        if hmac.compare_digest(candidate, KEY_HASH):return
+        raise HTTPException(401,'Connexion nécessaire')
     if PASS and hmac.compare_digest(req.headers.get('x-studio-key',''),PASS):return
     if not PASS:raise HTTPException(503,'Accès serveur non configuré')
     stamp=req.cookies.get('vicescope_session','')
@@ -86,7 +91,7 @@ def worker(job_id):
         if not source.is_file() and j['source_kind']=='youtube':
             update(job_id,'analyse',.03,'Import YouTube')
             url='https://www.youtube.com/watch?v='+j['source_label'].split()[-1]
-            subprocess.run([sys.executable,'-m','yt_dlp','--ignore-config','--no-playlist','--match-filter','!is_live & duration <= 10800','--max-filesize','500M','-f','b[ext=mp4]/b','-o',str(source),url],check=True,timeout=1800)
+            subprocess.run([sys.executable,'-m','yt_dlp','--ignore-config','--no-playlist','--js-runtimes','node','--match-filter','!is_live & duration <= 10800','--max-filesize','500M','-f','b[ext=mp4]/b','-o',str(source),url],check=True,timeout=1800)
         if not source.is_file():raise RuntimeError('Import impossible ou source hors limites')
         total=duration(source)
         a=seconds(str(j['start']) if j['start'] is not None else '',0)
