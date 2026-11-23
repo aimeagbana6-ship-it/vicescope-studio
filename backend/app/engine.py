@@ -169,7 +169,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     out.write_text(head+'\n'.join(rows)+'\n',encoding='utf-8')
 
 
-def export_clip(source: Path, output: Path, clip: dict, segments: list[dict]) -> dict:
+def export_clip(source: Path, output: Path, clip: dict, segments: list[dict], options=None, language='fr') -> dict:
     start=float(clip['start']); end=float(clip['end']);valid_range(start,end,duration(source))
     subs=output.with_suffix('.ass');subtitles_for_clip(segments,clip,subs)
     # Keep the entire game image and webcam visible: no permanent zoom/crop of the source.
@@ -178,6 +178,14 @@ def export_clip(source: Path, output: Path, clip: dict, segments: list[dict]) ->
            "[bg]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=25:10[blur];"
            "[fg]scale=1080:1920:force_original_aspect_ratio=decrease[front];"
            "[blur][front]overlay=(W-w)/2:(H-h)/2,subtitles='"+str(subs).replace("'","\\'").replace(":","\\:")+"'[v]")
+    if options:
+        from .composition import captions, graph as composition_graph
+        graph=composition_graph(source,options)
+        if options['style']!='off':
+            captions(source,clip,options,language,subs)
+            graph+=";[base]subtitles='"+str(subs).replace("'","\\'").replace(":","\\:")+"'[v]"
+        else:
+            graph+=";[base]null[v]"
     command(["ffmpeg","-hide_banner","-nostdin","-loglevel","error","-y","-ss",str(start),"-i",str(source),"-t",str(end-start),
              "-filter_complex_threads","2","-filter_complex",graph,"-map","[v]","-map","0:a:0?","-c:v","libx264","-threads","2","-preset","veryfast","-crf","24","-pix_fmt","yuv420p","-r","30",
              "-c:a","aac","-b:a","128k","-movflags","+faststart","-s","1080x1920",str(output)])
@@ -186,3 +194,4 @@ def export_clip(source: Path, output: Path, clip: dict, segments: list[dict]) ->
     if int(stream['width'])!=1080 or int(stream['height'])!=1920:
         raise RuntimeError('Export non conforme')
     return {"file":str(output),"duration":float(info['format']['duration']),"size_bytes":output.stat().st_size}
+

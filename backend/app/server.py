@@ -1,4 +1,9 @@
 """Prototype of a private VICEscope service; deploy only behind authentication on a persistent host."""
+from .composition import settings, detect
+from .engine import frame
+from starlette.background import BackgroundTask
+import zipfile
+import tempfile
 from .highlights import video_id, select
 import subprocess
 import sys
@@ -57,6 +62,9 @@ def initialize():
           id TEXT PRIMARY KEY, job_id TEXT, ordinal INTEGER, start REAL, finish REAL,
           title TEXT, why TEXT, path TEXT, duration REAL DEFAULT 0,
           state TEXT DEFAULT 'waiting', error TEXT DEFAULT '')''')
+    columns={r['name'] for r in sql('PRAGMA table_info(jobs)',fetch=True)}
+    for name,kind in [('options','TEXT'),('preview','INTEGER DEFAULT 0')]:
+        if name not in columns: sql(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
 initialize()
 
 
@@ -101,6 +109,17 @@ def worker(job_id):
         d=BASE/job_id
         d.mkdir(exist_ok=True)
         def report(stage,pc,message):update(job_id,stage,pc,message)
+        options=json.loads(j['options']) if j['options'] else None
+        if options and (j['preview'] or (options['layout']!='standard' and not options['camera'])):
+            at=a+(b-a)*.05
+            if options['layout']!='standard':
+                options['camera'],at=detect(source,a,b)
+                sql('UPDATE jobs SET options=? WHERE id=?',(json.dumps(options),job_id))
+            if j['preview'] or not options['camera'] and options['layout']!='standard':
+                frame(source,d/'preview.jpg',at)
+                sql("UPDATE jobs SET options=?,stage='preview_ready',message=? WHERE id=?",
+                    (json.dumps(options),'Aperçu prêt à valider',job_id))
+                return
         report('analyse',.15,'Recherche de passages par variations visuelles')
         transcripts=[]
         candidates=select(source,a,b,j['maximum'])
@@ -118,7 +137,7 @@ def worker(job_id):
             sql('UPDATE clips SET state=? WHERE id=?',('rendering',cid))
             report('montage',.76+.19*i/len(candidates),f'Export {i+1}/{len(candidates)}')
             output=outputs/f'{cid}.mp4'
-            x=export_clip(source,output,c,transcripts)
+            x=export_clip(source,output,c,transcripts,options,j['lang'])
             sql('UPDATE clips SET path=?,duration=?,state=?,error=? WHERE id=?',
                 (str(output),x['duration'],'done','',cid))
         report('export',.98,'Vérification des fichiers')
@@ -157,7 +176,7 @@ async def login(request:Request):
 @app.get('/api/session')
 async def session(request:Request):
     check_request(request)
-    return {'ok':True}
+    return {'ok':True,'composition_version':2}
 
 
 @app.get('/api/jobs')
@@ -213,7 +232,9 @@ async def download_direct(url: str, output:Path):
 async def create_job(request:Request,
     link:str=Form(''),file:UploadFile|None=File(None),start:str=Form(''),end:str=Form(''),
     max_clips:int=Form(10),language:str=Form('fr'),instructions:str=Form(''),
-    authorized:bool=Form(False)):
+    authorized:bool=Form(False),layout:str=Form('standard'),share:int=Form(35),
+    caption_style:str=Form('off'),caption_position:str=Form('lower'),caption_y:float|None=Form(None),
+    preview:bool=Form(False)):
     check_request(request)
     if not authorized:raise HTTPException(400,'Confirmez que vous êtes autorisé à traiter cette vidéo')
     if not 1 <= max_clips <= 30:raise HTTPException(400,'Maximum non valide')
@@ -221,6 +242,8 @@ async def create_job(request:Request,
     if not file and not link.strip():raise HTTPException(400,'Fournissez un MP4 autorisé ou une URL directe autorisée')
     key=video_id(link) if link else None
     if link and (file or not key):raise HTTPException(422,'Choisis un fichier ou un lien vidéo YouTube valide')
+    try: options=settings(layout,share,caption_style,caption_position,caption_y)
+    except ValueError as e: raise HTTPException(422,str(e))
     jid=secrets.token_hex(12)
     d=BASE/jid;d.mkdir(mode=0o700,exist_ok=True)
     target=d/'source.mp4'
@@ -249,9 +272,9 @@ async def create_job(request:Request,
         target.unlink(missing_ok=True)
         raise HTTPException(400,'Fichier ou plage invalide')
     sql('''INSERT INTO jobs(id,source_kind,source_label,stage,progress,message,start,finish,lang,maximum,instructions,
-      source_path,created_at,updated_at,allow_cost,analysis_model)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-        (jid,kind,label,'queued',0,'En attente',a,b,language,max_clips,instructions[:3000],str(target),time.time(),time.time(),0,'variation-visuelle'))
+      source_path,created_at,updated_at,allow_cost,analysis_model,options,preview)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+        (jid,kind,label,'queued',0,'En attente',a,b,language,max_clips,instructions[:3000],str(target),time.time(),time.time(),0,'variation-visuelle',json.dumps(options),int(preview)))
     start_job(jid)
     return {'job_id':jid,'stage':'queued','source_duration':length}
 
@@ -292,7 +315,7 @@ async def redo(cid:str,request:Request):
             for p in sorted((BASE/c['job_id']/'chunks').glob('transcript_*.json')):
                 segs.extend(json.loads(p.read_text(encoding='utf-8')))
             tmp=path.with_suffix('.new.mp4')
-            result=export_clip(Path(j['source_path']),tmp,{'start':a,'end':b},segs)
+            result=export_clip(Path(j['source_path']),tmp,{'start':a,'end':b},segs,json.loads(j['options']) if j['options'] else None,j['lang'])
             os.replace(tmp,path)
             subs=tmp.with_suffix('.ass');subs.unlink(missing_ok=True)
             sql('UPDATE clips SET state=?,duration=?,error=? WHERE id=?',('done',result['duration'],'',cid))
@@ -315,3 +338,47 @@ async def clip_file(cid:str,request:Request):
 @app.get('/')
 async def home():
     return FileResponse(ROOT/'static'/'index.html')
+
+
+@app.get('/api/jobs/{job_id}/preview')
+def preview_frame(job_id:str,request:Request):
+    check_request(request)
+    j=job(job_id)
+    path=Path(j['source_path']).parent/'preview.jpg'
+    if not path.exists():raise HTTPException(404,'Image indisponible')
+    return FileResponse(path,media_type='image/jpeg')
+
+@app.post('/api/jobs/{job_id}/apply')
+async def apply_layout(job_id:str,request:Request):
+    check_request(request)
+    obj=await request.json()
+    try:
+        opts=settings(obj['layout'],int(obj['share']),obj['style'],obj['position'],float(obj['y']),obj.get('camera'))
+        if opts['layout']!='standard' and not opts['camera']:raise ValueError('Trace le cadre caméra sur la source')
+    except (ValueError,KeyError,TypeError) as e: raise HTTPException(422,str(e))
+    with _mutex,connect() as con:
+        if job_id in _pending: raise HTTPException(409,'Préparation en cours, réessaie dans un instant')
+        changed=con.execute("UPDATE jobs SET options=?,preview=0,stage='queued' WHERE id=? AND stage='preview_ready'",(json.dumps(opts),job_id)).rowcount
+        if not changed:raise HTTPException(409,'Cette tâche ne peut plus être modifiée')
+    start_job(job_id)
+    return {'ok':True}
+
+@app.get('/api/jobs/{job_id}/archive')
+def download_series(job_id:str,request:Request):
+    check_request(request)
+    j=job(job_id)
+    clips=sql('SELECT ordinal,path,state FROM clips WHERE job_id=? ORDER BY ordinal',(job_id,),True)
+    if j['stage']!='done' or not clips or any(c['state']!='done' for c in clips):
+        raise HTTPException(409,'Les rendus sont encore en cours')
+    with tempfile.NamedTemporaryFile(suffix='.zip',delete=False) as tmp:
+        path=Path(tmp.name)
+    try:
+        with zipfile.ZipFile(path,'w',compression=zipfile.ZIP_STORED) as archive:
+            for c in clips:
+                media=Path(c['path']).resolve()
+                if not media.is_file() or not media.is_relative_to(BASE):raise HTTPException(404,'Export absent')
+                archive.write(media,f"Short-{c['ordinal']+1:02d}.mp4")
+        return FileResponse(path,media_type='application/zip',filename=f'VICEscope-{job_id}.zip',background=BackgroundTask(path.unlink,missing_ok=True))
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
