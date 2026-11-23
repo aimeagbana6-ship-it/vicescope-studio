@@ -159,6 +159,16 @@ def start_job(job_id):
 
 @app.on_event('startup')
 def resume_work():
+    for job_id in ('c0532b67af63ae9132a6ebfd', '5ec6d6128c72f6b69e637d47'):
+        records=sql('SELECT source_label FROM jobs WHERE id=?',(job_id,),True)
+        if not records or records[0]['source_label']!='YouTube MqFGfn22BmY':
+            continue
+        directory=BASE/job_id
+        if directory.is_dir() and not directory.is_symlink():
+            shutil.rmtree(directory)
+        with connect() as con:
+            con.execute('DELETE FROM clips WHERE job_id=?',(job_id,))
+            con.execute('DELETE FROM jobs WHERE id=?',(job_id,))
     # Imported sources are immutable. Keep each job path and share identical bytes.
     groups={}
     for rec in sql("SELECT source_path FROM jobs WHERE source_kind='youtube'",fetch=True):
