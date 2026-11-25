@@ -52,6 +52,28 @@ def sql(statement,params=(),fetch=False):
         return [dict(r) for r in cur.fetchall()] if fetch else cur.lastrowid
 
 
+CACHE = Path(tempfile.gettempdir())/'vicescope-youtube'
+
+def youtube_cache(jid):
+    return CACHE/jid
+
+def clean_finished_job(jid):
+    # A failed import with exported clips can still be reopened for editing.
+    if len(jid)!=24 or any(ch not in '0123456789abcdef' for ch in jid):
+        return
+    rec=sql("SELECT stage FROM jobs WHERE id=?",(jid,),True)
+    if not rec or rec[0]['stage'] not in ('failed','downloaded'):
+        return
+    if sql("SELECT 1 FROM clips WHERE job_id=? AND state='done'",(jid,),True):
+        return
+    for path in (BASE/jid,youtube_cache(jid)):
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+
+def clean_finished_jobs():
+    for row in sql("SELECT id FROM jobs WHERE stage IN ('failed','downloaded')",fetch=True):
+        clean_finished_job(row['id'])
+
 def initialize():
     sql('''CREATE TABLE IF NOT EXISTS jobs(
           id TEXT PRIMARY KEY, source_kind TEXT, source_label TEXT, stage TEXT NOT NULL,
@@ -63,6 +85,7 @@ def initialize():
           id TEXT PRIMARY KEY, job_id TEXT, ordinal INTEGER, start REAL, finish REAL,
           title TEXT, why TEXT, path TEXT, duration REAL DEFAULT 0,
           state TEXT DEFAULT 'waiting', error TEXT DEFAULT '')''')
+    clean_finished_jobs()
     columns={r['name'] for r in sql('PRAGMA table_info(jobs)',fetch=True)}
     for name,kind in [('options','TEXT'),('preview','INTEGER DEFAULT 0'),('replay_task','TEXT'),('replay_redo','TEXT')]:
         if name not in columns: sql(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
@@ -92,15 +115,23 @@ def update(job_id,stage,progress,message,error=''):
         (stage,float(progress),message,error,time.time(),job_id))
 
 
+def local_source(j):
+    source=Path(j['source_path'])
+    if not source.is_file() and j['source_kind']=='youtube':
+        source=youtube_cache(j['id'])/'source.mp4'
+        source.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        if source.is_file():return source
+        url='https://www.youtube.com/watch?v='+j['source_label'].split()[-1]
+        subprocess.run([sys.executable,'-m','yt_dlp','--ignore-config','--no-playlist','--js-runtimes','node','--match-filter','!is_live & duration <= 10800','--max-filesize','500M','-f','b[ext=mp4][height<=480]/b[height<=480]','-o',str(source.with_name('import.mp4')),url],check=True,timeout=1800)
+        os.replace(source.with_name('import.mp4'),source)
+    return source
+
+
 def worker(job_id):
     started=time.monotonic()
     try:
         j=job(job_id)
-        source=Path(j['source_path'])
-        if not source.is_file() and j['source_kind']=='youtube':
-            update(job_id,'analyse',.03,'Import YouTube')
-            url='https://www.youtube.com/watch?v='+j['source_label'].split()[-1]
-            subprocess.run([sys.executable,'-m','yt_dlp','--ignore-config','--no-playlist','--js-runtimes','node','--match-filter','!is_live & duration <= 10800','--max-filesize','500M','-f','b[ext=mp4][height<=480]/b[height<=480]','-o',str(source),url],check=True,timeout=1800)
+        source=local_source(j)
         if not source.is_file():raise RuntimeError('Import impossible ou source hors limites')
         total=duration(source)
         a=seconds(str(j['start']) if j['start'] is not None else '',0)
@@ -144,7 +175,12 @@ def worker(job_id):
         report('export',.98,'Vérification des fichiers')
         update(job_id,'done',1,f'{len(candidates)} clip(s) prêts')
     except Exception as exc:
-        update(job_id,'failed',0,'Traitement interrompu',str(exc)[:1200])
+        try:
+            if not sql("SELECT 1 FROM clips WHERE job_id=? AND state='done'",(job_id,),True):
+                shutil.rmtree(youtube_cache(job_id),ignore_errors=True)
+        finally:
+            update(job_id,'failed',0,'Traitement interrompu',str(exc)[:1200])
+        clean_finished_job(job_id)
     finally:
         sql('UPDATE jobs SET processing_seconds=processing_seconds+? WHERE id=?',(time.monotonic()-started,job_id))
         with _mutex:_pending.discard(job_id)
@@ -290,7 +326,7 @@ async def login(request:Request):
 @app.get('/api/session')
 async def session(request:Request):
     check_request(request)
-    return {'ok':True,'composition_version':2}
+    return {'ok':True,'composition_version':2,'storage_free_mib':shutil.disk_usage(BASE).free//(1024**2)}
 
 
 @app.get('/api/jobs')
@@ -350,6 +386,8 @@ async def create_job(request:Request,
     caption_style:str=Form('off'),caption_position:str=Form('lower'),caption_y:float|None=Form(None),
     preview:bool=Form(False)):
     check_request(request)
+    if shutil.disk_usage(BASE).free < 16*1024**2:
+        clean_finished_jobs()
     if shutil.disk_usage(BASE).free < 2*1024**2:
         raise HTTPException(507,'Le stockage du serveur est plein. Libère de la place avant de lancer un montage.')
     if not authorized:raise HTTPException(400,'Confirmez que vous êtes autorisé à traiter cette vidéo')
@@ -439,7 +477,7 @@ async def redo(cid:str,request:Request):
             for p in sorted((BASE/c['job_id']/'chunks').glob('transcript_*.json')):
                 segs.extend(json.loads(p.read_text(encoding='utf-8')))
             tmp=path.with_suffix('.new.mp4')
-            result=export_clip(Path(j['source_path']),tmp,{'start':a,'end':b},segs,json.loads(j['options']) if j['options'] else None,j['lang'])
+            result=export_clip(local_source(j),tmp,{'start':a,'end':b},segs,json.loads(j['options']) if j['options'] else None,j['lang'])
             os.replace(tmp,path)
             subs=tmp.with_suffix('.ass');subs.unlink(missing_ok=True)
             sql('UPDATE clips SET state=?,duration=?,error=? WHERE id=?',('done',result['duration'],'',cid))
@@ -489,6 +527,7 @@ async def apply_layout(job_id:str,request:Request):
                 raise HTTPException(400,'Identifiant invalide')
             # Reclaim disk before writing SQLite, which may be on a full volume.
             if directory.is_dir():shutil.rmtree(directory)
+            shutil.rmtree(youtube_cache(job_id),ignore_errors=True)
             with connect() as con:
                 con.execute('DELETE FROM clips WHERE job_id=?',(job_id,))
                 con.execute("UPDATE jobs SET stage='downloaded',message='Téléchargement confirmé, fichiers effacés' WHERE id=?",(job_id,))
