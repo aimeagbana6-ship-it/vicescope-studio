@@ -122,8 +122,22 @@ def local_source(j):
         source.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
         if source.is_file():return source
         url='https://www.youtube.com/watch?v='+j['source_label'].split()[-1]
-        subprocess.run([sys.executable,'-m','yt_dlp','--ignore-config','--no-playlist','--js-runtimes','node','--match-filter','!is_live & duration <= 10800','--max-filesize','500M','-f','b[ext=mp4][height<=480]/b[height<=480]','-o',str(source.with_name('import.mp4')),url],check=True,timeout=1800)
-        os.replace(source.with_name('import.mp4'),source)
+        output=source.with_name('import.mp4')
+        command=[sys.executable,'-m','yt_dlp','--ignore-config','--no-playlist',
+                 '--no-progress','--js-runtimes','node','--match-filter','!is_live',
+                 '--concurrent-fragments','4','--abort-on-unavailable-fragments',
+                 '-f','b[ext=mp4][height<=480]/bv[height<=480]+ba/b[height<=480]',
+                 '--merge-output-format','mp4','-o',str(output),url]
+        result=subprocess.run(command,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,text=True,timeout=10800)
+        if result.returncode:
+            errors=[line for line in result.stderr.splitlines() if 'ERROR:' in line]
+            detail=errors[-1].split('ERROR:',1)[1].strip() if errors else 'Téléchargement interrompu'
+            import re
+            raise RuntimeError('Import YouTube : '+re.sub(r'https?://\S+', '[URL]', detail)[:400])
+        if not output.is_file():
+            raise RuntimeError('YouTube ne fournit aucun fichier pour ce replay. Vérifie que le direct est terminé.')
+        duration(output)
+        os.replace(output,source)
     return source
 
 
@@ -285,6 +299,11 @@ def start_job(job_id):
 
 @app.on_event('startup')
 def resume_work():
+    # Retry jobs skipped by the retired three-hour / 500 MB import filters once.
+    sql("""UPDATE jobs SET stage='queued', error='', message='Nouvel import du replay'
+           WHERE stage='failed' AND source_kind='youtube' AND error LIKE ?
+           AND NOT EXISTS (SELECT 1 FROM clips WHERE clips.job_id=jobs.id)""",
+        ("%No such file or directory:%/import.mp4%' -> '%/source.mp4'%",))
     # Imported sources are immutable. Keep each job path and share identical bytes.
     groups={}
     for rec in sql("SELECT source_path FROM jobs WHERE source_kind='youtube'",fetch=True):

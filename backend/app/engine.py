@@ -40,8 +40,6 @@ def seconds(s: str | None, default: float) -> float:
 def valid_range(start: float, end: float, total: float) -> None:
     if not (0 <= start < end <= total + .1):
         raise ValueError(f"Plage invalide : {start:.1f}–{end:.1f}s pour {total:.1f}s")
-    if end-start > 3*3600:
-        raise ValueError("La plage excède la limite de trois heures")
 
 
 def cut_audio(source: Path, out: Path, start: float, length: float) -> None:
