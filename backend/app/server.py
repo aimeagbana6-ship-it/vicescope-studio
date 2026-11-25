@@ -402,7 +402,7 @@ async def create_job(request:Request,
     link:str=Form(''),file:UploadFile|None=File(None),start:str=Form(''),end:str=Form(''),
     max_clips:int=Form(10),language:str=Form('fr'),instructions:str=Form(''),
     authorized:bool=Form(False),layout:str=Form('standard'),share:int=Form(35),
-    caption_style:str=Form('off'),caption_position:str=Form('lower'),caption_y:float|None=Form(None),
+    caption_style:str=Form('off'),caption_position:str=Form('lower'),caption_y:float|None=Form(None),caption_font:str=Form('auto'),caption_size:int=Form(58),
     preview:bool=Form(False)):
     check_request(request)
     if shutil.disk_usage(BASE).free < 16*1024**2:
@@ -415,7 +415,7 @@ async def create_job(request:Request,
     if not file and not link.strip():raise HTTPException(400,'Fournissez un MP4 autorisé ou une URL directe autorisée')
     key=video_id(link) if link else None
     if link and (file or not key):raise HTTPException(422,'Choisis un fichier ou un lien vidéo YouTube valide')
-    try: options=settings(layout,share,caption_style,caption_position,caption_y)
+    try: options=settings(layout,share,caption_style,caption_position,caption_y,font=caption_font,size=caption_size)
     except ValueError as e: raise HTTPException(422,str(e))
     jid=secrets.token_hex(12)
     d=BASE/jid;d.mkdir(mode=0o700,exist_ok=True)
@@ -552,7 +552,7 @@ async def apply_layout(job_id:str,request:Request):
                 con.execute("UPDATE jobs SET stage='downloaded',message='Téléchargement confirmé, fichiers effacés' WHERE id=?",(job_id,))
         return {'ok':True}
     try:
-        opts=settings(obj['layout'],int(obj['share']),obj['style'],obj['position'],float(obj['y']),obj.get('camera'))
+        opts=settings(obj['layout'],int(obj['share']),obj['style'],obj['position'],float(obj['y']),obj.get('camera'),obj.get('font','auto'),obj.get('size',58))
         if opts['layout']!='standard' and not opts['camera']:raise ValueError('Trace le cadre caméra sur la source')
     except (ValueError,KeyError,TypeError) as e: raise HTTPException(422,str(e))
     with _mutex,connect() as con:

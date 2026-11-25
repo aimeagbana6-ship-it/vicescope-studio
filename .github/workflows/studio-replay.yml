@@ -22,7 +22,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+      - run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg fonts-open-sans fonts-liberation
       - run: python -m pip install -r backend/requirements.txt
       - run: python -m scripts.studio_replay
         env:

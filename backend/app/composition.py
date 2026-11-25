@@ -6,8 +6,12 @@ from .engine import ass_escape, ass_timestamp, probe
 
 POSITIONS = {'top': 17, 'middle': 50, 'lower': 70, 'bottom': 85}
 
-def settings(layout, share, style, position, y=None, camera=None):
-    if layout not in ('standard','streamer_top','streamer_bottom') or style not in ('off','classic','bold','box','spectacular'):
+FONTS = {'auto':'Arial','vice':'Open Sans Extrabold','sans':'Liberation Sans','serif':'Liberation Serif','mono':'Liberation Mono'}
+
+def settings(layout, share, style, position, y=None, camera=None, font='auto', size=58):
+    if font not in FONTS or type(size) is not int or not 32 <= size <= 96:
+        raise ValueError('Police ou taille invalide')
+    if layout not in ('standard','streamer_top','streamer_bottom') or style not in ('off','classic','bold','box','spectacular','vice'):
         raise ValueError('Disposition ou style invalide')
     if position not in POSITIONS or not 20 <= share <= 80:
         raise ValueError('Position ou proportion invalide')
@@ -19,7 +23,7 @@ def settings(layout, share, style, position, y=None, camera=None):
         x,t,w,h = camera
         if not (0 <= x < 1 and 0 <= t < 1 and .03 <= w <= 1 and .03 <= h <= 1 and x+w <= 1.000001 and t+h <= 1.000001):
             raise ValueError('Cadre caméra invalide')
-    return dict(layout=layout,share=share,style=style,position=position,y=y,camera=camera)
+    return dict(layout=layout,share=share,style=style,position=position,y=y,camera=camera,font=font,size=size)
 
 def detect(source, start, end):
     import cv2
@@ -96,6 +100,11 @@ def captions(source,clip,opts,language,path):
     def row(start,end,line):
         if end<=start:return ''
         tags=r'{\an5\pos(540,'+str(round(opts['y']*19.2))+r')\bord5}'
+        font = opts.get('font','auto')
+        if font=='auto' and style=='vice': font='vice'
+        tags += r'{\fn'+FONTS[font]+r'\fs'+str(opts.get('size',58))+'}'
+        if font=='vice': tags += r'{\b800\i1}'
+        if style=='vice': tags += r'{\3c&H32103B&\4c&H32103B&\shad2}'
         return f'Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},Main,,0,0,0,,{tags}{line}\n'
     with path.open('a',encoding='utf8') as out:
         for i in range(0,len(data),4):
@@ -107,6 +116,12 @@ def captions(source,clip,opts,language,path):
                     out.write(row(a,b,line))
             else:
                 line=' '.join(strings)
+                if style=='vice':
+                    # Ivory introduction, pink and orange emphasis, turquoise punctuation.
+                    split=len(strings)//2
+                    colors=['FAFAFF' if k<split else 'A523FF' if k==split else '2699FF' for k in range(len(strings))]
+                    import re
+                    line=' '.join(r'{\c&H'+color+'&}'+re.sub(r'([!?.,…]+)$',lambda m:r'{\c&HDCD900&}'+m[0],word) for color,word in zip(colors,strings))
                 if style=='bold':line=r'{\c&H39DFFF&}'+line.upper()
                 if style=='box':line=r'{\bord8\shad0\3c&H191919&}'+line
                 out.write(row(group[0][0],group[-1][1],line))

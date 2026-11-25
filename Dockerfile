@@ -1,6 +1,6 @@
 FROM node:22-bookworm-slim AS javascript
 FROM python:3.12-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg fonts-open-sans fonts-liberation && rm -rf /var/lib/apt/lists/*
 COPY --from=javascript /usr/local/bin/node /usr/local/bin/node
 WORKDIR /studio
 COPY backend/requirements.txt .
