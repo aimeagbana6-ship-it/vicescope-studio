@@ -28,7 +28,7 @@
 <div id="workspace" class="hidden"><div class="tabs"><button data-view="new" class="active">Nouveau montage</button><button data-view="processing">Traitement</button><button data-view="results">Résultats</button></div>
 <section id="view-new"><div class="eyebrow">Éditeur automatique</div><h1>Créer des Shorts</h1><p>Importe une vidéo et sélectionne le nombre de passages à monter en 9:16.</p>
 <div class="panel"><div id="engineStatus" class="warn" role="status">Connexion au serveur de montage…</div><button type="button" class="secondary hidden" id="retryEngine">Revérifier la connexion</button><form id="newform"><label>Lien YouTube</label><input type="url" name="link" placeholder="https://www.youtube.com/watch?v=…">
-<label>Ou fichier vidéo MP4 autorisé</label><input type="file" name="file" accept="video/mp4,video/quicktime,video/*"><p class="note">MP4 de 64 Mio maximum. Plage de montage de 3 heures maximum.</p>
+<label>Ou fichier vidéo MP4 autorisé</label><input type="file" name="file" accept="video/mp4,video/quicktime,video/*"><p class="note">Fichier MP4 de 64 Mio maximum. Laisse la fin vide pour analyser toute la vidéo.</p>
 <div class="cols"><div><label>Début (facultatif)</label><input name="start" placeholder="00:00:00"></div><div><label>Fin (facultative)</label><input name="end" placeholder="00:10:00"></div></div>
 <div class="cols"><div><label>Shorts maximum</label><input type="number" min="1" max="30" name="max_clips" value="3" required></div></div>
 

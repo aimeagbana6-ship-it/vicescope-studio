@@ -1,0 +1,42 @@
+name: Importer un replay pour le Studio
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: studio-replay-${{ inputs.task }}
+  cancel-in-progress: false
+jobs:
+  render:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: sudo apt-get update -qq && sudo apt-get install -y ffmpeg
+      - run: python -m pip install -r backend/requirements.txt
+      - run: python -m scripts.studio_replay
+        env:
+          TASK_ID: ${{ inputs.task }}
+          STUDIO_URL: ${{ vars.STUDIO_ENGINE_URL }}
+          REPLAY_KEY: ${{ secrets.STUDIO_REPLAY_KEY }}
+      - name: Signaler une interruption au Studio
+        if: ${{ failure() || cancelled() }}
+        env:
+          TASK_ID: ${{ inputs.task }}
+          STUDIO_URL: ${{ vars.STUDIO_ENGINE_URL }}
+          REPLAY_KEY: ${{ secrets.STUDIO_REPLAY_KEY }}
+        run: |
+          [[ "$TASK_ID" =~ ^[0-9a-f]{32}$ ]] || exit 1
+          curl -sS -o /dev/null --max-time 30 -H "X-Replay-Key: $REPLAY_KEY" \
+            -H 'Content-Type: application/json' -d '{"kind":"failed","message":"Exécution GitHub Actions interrompue"}' \
+            "${STUDIO_URL%/}/api/replay/$TASK_ID/"

@@ -64,7 +64,7 @@ def initialize():
           title TEXT, why TEXT, path TEXT, duration REAL DEFAULT 0,
           state TEXT DEFAULT 'waiting', error TEXT DEFAULT '')''')
     columns={r['name'] for r in sql('PRAGMA table_info(jobs)',fetch=True)}
-    for name,kind in [('options','TEXT'),('preview','INTEGER DEFAULT 0')]:
+    for name,kind in [('options','TEXT'),('preview','INTEGER DEFAULT 0'),('replay_task','TEXT'),('replay_redo','TEXT')]:
         if name not in columns: sql(f'ALTER TABLE jobs ADD COLUMN {name} {kind}')
 initialize()
 
@@ -150,7 +150,97 @@ def worker(job_id):
         with _mutex:_pending.discard(job_id)
 
 
+def dispatch_replay(jid, redo=None):
+    task=secrets.token_hex(16)
+    sql("UPDATE jobs SET replay_task=?, replay_redo=?, stage='analyse', message=?, updated_at=? WHERE id=?",
+        (task,json.dumps(redo or []),'En attente de GitHub Actions',time.time(),jid))
+    def dispatch():
+        try:
+            response=httpx.post('https://api.github.com/repos/aimeagbana6-ship-it/vicescope-studio/actions/workflows/studio-replay.yml/dispatches',
+                headers={'Authorization':'Bearer '+os.environ['STUDIO_ACTIONS_TOKEN']},
+                json={'ref':'main','inputs':{'task':task}},timeout=30)
+            response.raise_for_status()
+        except (httpx.HTTPError,KeyError):
+            sql("UPDATE jobs SET stage='failed',message=? WHERE replay_task=?",
+                ('GitHub Actions indisponible. Vérifie la configuration du Studio.',task))
+    threading.Thread(target=dispatch,daemon=True).start()
+
+
+def replay_request(task,request):
+    secret=os.getenv('STUDIO_REPLAY_KEY','')
+    if not secret or not hmac.compare_digest(request.headers.get('x-replay-key',''),secret):
+        raise HTTPException(401,'Connexion nécessaire')
+    rows=sql("SELECT * FROM jobs WHERE replay_task=? AND stage IN ('analyse','montage')",(task,),True)
+    if not rows:raise HTTPException(409,'Tâche expirée')
+    return rows[0]
+
+
+@app.get('/api/replay/{task}/')
+def replay_config(task:str,request:Request):
+    j=replay_request(task,request)
+    return dict(key=j['source_label'].split()[-1],options=json.loads(j['options']),
+        redo=json.loads(j['replay_redo']), **{k:j[k] for k in ('start','finish','maximum','preview','lang')})
+
+
+@app.put('/api/replay/{task}/{name}')
+async def receive_render(task:str,name:str,request:Request):
+    j=replay_request(task,request)
+    if name!='preview' and name not in map(str,range(j['maximum'])):
+        raise HTTPException(422,'Export inconnu')
+    directory=BASE/j['id']/task
+    directory.mkdir(exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=directory,delete=False) as stream:
+        tmp=Path(stream.name)
+        try:
+            async for block in request.stream():
+                stream.write(block)
+            stream.close()
+            os.replace(tmp,directory/name)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return {'ok':True}
+
+
+@app.post('/api/replay/{task}/')
+async def replay_event(task:str,request:Request):
+    data=await request.json()
+    with _mutex:
+        j=replay_request(task,request)
+        jid=j['id']
+        directory=BASE/jid/task
+        kind=data['kind']
+        if kind=='progress':
+            update(jid,'analyse',data['progress'],data['message'])
+        elif kind=='failed':
+            update(jid,'failed',0,'Traitement interrompu',data['message'])
+        elif kind=='preview':
+            os.replace(directory/'preview',BASE/jid/'preview.jpg')
+            sql("UPDATE jobs SET options=?,stage='preview_ready',message=? WHERE id=?",
+                (json.dumps(data['options']),'Aperçu prêt à valider',jid))
+        elif kind=='done':
+            clips=data['clips']
+            with connect() as con:
+                for i,c in enumerate(clips):
+                    ordinal=c.get('ordinal',i)
+                    path=directory/str(ordinal)
+                    if not path.is_file():raise HTTPException(409,'Export incomplet')
+                    cid=hashlib.sha256(f'{jid}:{ordinal}'.encode()).hexdigest()[:24]
+                    con.execute("""INSERT INTO clips(id,job_id,ordinal,start,finish,title,why,path,duration,state)
+                        VALUES(?,?,?,?,?,?,?,?,?,'done') ON CONFLICT(id) DO UPDATE SET
+                        start=excluded.start,finish=excluded.finish,path=excluded.path,duration=excluded.duration,state='done',error=''""",
+                        (cid,jid,ordinal,c['start'],c['end'],c['title'],c['why'],str(path),c['duration']))
+                con.execute("UPDATE jobs SET stage='done',progress=1,finish=?,message=?,updated_at=? WHERE id=?",
+                    (data['finish'],'Montage terminé' if clips else 'Aucun passage détecté',time.time(),jid))
+        else:
+            raise HTTPException(422,'Événement inconnu')
+    return {'ok':True}
+
+
 def start_job(job_id):
+    j=job(job_id)
+    if j["source_kind"]=="youtube" and os.getenv("STUDIO_REPLAY_KEY"):
+        dispatch_replay(job_id)
+        return
     with _mutex:
         if job_id in _pending:return
         _pending.add(job_id)
@@ -182,7 +272,7 @@ def resume_work():
             finally:
                 temp.unlink(missing_ok=True)
     print('Studio storage available (MiB):',shutil.disk_usage(BASE).free//(1024**2),flush=True)
-    for j in sql("SELECT id FROM jobs WHERE stage IN ('queued','analyse','montage','export')",fetch=True):
+    for j in sql("SELECT id FROM jobs WHERE replay_task IS NULL AND stage IN ('queued','analyse','montage','export')",fetch=True):
         start_job(j['id'])
 
 
@@ -293,7 +383,10 @@ async def create_job(request:Request,
         a=seconds(start,0)
         b=seconds(end,length)
         if length is not None:valid_range(a,b,length)
-        elif b is not None:valid_range(a,b,b)
+        elif b is not None:
+            if os.getenv("STUDIO_REPLAY_KEY"):
+                if not 0 <= a < b:raise ValueError("Plage invalide")
+            else:valid_range(a,b,b)
     except Exception as exc:
         target.unlink(missing_ok=True)
         raise HTTPException(400,'Fichier ou plage invalide')
@@ -332,6 +425,11 @@ async def redo(cid:str,request:Request):
     a=max(float(j['start']),float(c['start'])+shift)
     b=float(c['finish'])
     if b-a<5:raise HTTPException(422,'Clip trop court après correction')
+    if j['replay_task']:
+        with _mutex:
+            if job(j['id'])['stage']!='done':raise HTTPException(409,'Montage en cours')
+            dispatch_replay(j['id'],[dict(ordinal=c['ordinal'],start=a,end=b,title=c['title'],why=c['why'])])
+        return {'ok':True,'stage':'rendering'}
     sql('UPDATE clips SET state=?,start=? WHERE id=?',('rendering',a,cid))
     def task():
         try:
